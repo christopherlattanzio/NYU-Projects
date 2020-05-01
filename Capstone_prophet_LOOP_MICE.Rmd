@@ -1,0 +1,280 @@
+---
+title: "All Shows - forecasts"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+# Code Chunk 1: Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "hide")
+```
+
+# Code Chunk 2: Package Setup
+```{r Package Check, include = FALSE}
+#clears out all datas
+rm(list = ls())
+
+#specify the packages of interest
+packages = c("ggplot2" , "forecast", "randomForest", "e1071","nnet","readr", "dplyr","fame","bigrquery","tidyverse","scales","rpart","lubridate", "broom", "CombMSC", "leaps", "Boruta", "base", "fuzzyjoin",  "DataCombine", "imputeTS","mice" ,"DMwR", "prophet","qpcR","tidyr", "plyr", "dygraphs")
+
+#use this function to check if each package is on the local machine
+#if a package is installed, it will be loaded
+#if any are not, the missing package(s) will be installed and loaded
+package.check <- lapply(packages, FUN = function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE)
+    library(x, character.only = TRUE)
+  }
+})
+
+#verify they are loaded
+search()
+
+
+# Prevents sci notation
+options(scipen=9999)
+
+
+####################################################################
+# Code Chunk 3: Connecting to Google Big Query and Pulling in Data
+# pulls in data from google big query
+# install.packages('devtools') devtools::install_github("rstats-db/bigrquery")
+# Use your project ID here
+project <- "capstone-247602" # put your project ID here
+# Example query - select copies of files with content containing "TODO"
+#sql <- "SELECT * FROM [combined_digital_linear.tbl_Joined_By_Series_Name_And_AirDate]"
+sql <- "SELECT * FROM [combined_digital_linear.tbl_title_matching_stage_3_FINAL]"
+
+# try with average mins viewed
+# tbl_Digital_series_event_date - includes series
+# tbl_Digital_genre_event_date - includes genre
+# tbl_Digital_event_date - total
+# tbl_Digital_series_event_date_AMV - Average Mins Viewed
+
+# Execute the query and store the result
+Complete_Data <- query_exec(sql, project = project, useLegacySql = FALSE)
+####################################################################
+# Code Chunk 4: List of shows we selected.
+# Selection criteria:
+# more then 2 season of a show.
+# The show aired this current year.
+
+shows <- c('BETTER LATE THAN NEVER',	'ELLEN\'S GAME OF GAMES',	'FOOD FIGHTERS',	'LAST COMIC STANDING',	'LITTLE BIG SHOTS',	'MAKING IT',	'SPARTAN: ULTIMATE TEAM CHALLENGE',	'THE CELEBRITY APPRENTICE',	'THE VOICE',	'THE WALL',	'WORLD OF DANCE',	'BROOKLYN NINE-NINE',	'GREAT NEWS',	'MARLON',	'PARKS AND RECREATION',	'SUPERSTORE',	'THE GOOD PLACE',	'TRIAL & ERROR',	'WELCOME TO SWEDEN',	'WILL & GRACE',	'AQUARIUS',	'CHICAGO FIRE',	'CHICAGO MED',	'CHICAGO P.D.',	'GOOD GIRLS',	'HANNIBAL',	'LAW & ORDER: SPECIAL VICTIMS UNIT',	'MIDNIGHT, TEXAS',	'NEW AMSTERDAM',	'PARENTHOOD',	'TAKEN',	'THE BLACKLIST',	'THE MYSTERIES OF LAURA',	'THIS IS US',	'TIMELESS')
+####################################################################
+# Code Chunk 5: Starts loop
+stats <- NULL # will hold the stats for all the shows
+
+for ( w in shows) {
+
+ShowName <- w 
+
+dat1 <- rename(subset(Complete_Data[,c('airdate', 'average_mins_viewed')], Complete_Data$series == ShowName),c("airdate"="ds", "average_mins_viewed"="y"))
+
+dat1 <- dat1[order(dat1$ds),]
+
+nrowsdf <- nrow(dat1)
+#
+
+dat2 <- rename(subset(Complete_Data[,c('airdate', 'Imps')], Complete_Data$series == ShowName),c("airdate"="ds", "Imps"="y"))
+
+dat2 <- dat2[order(dat1$ds),]
+
+####################################################################
+# Code Chunk 6: Creating full time series set of dates for Digital
+# digital
+# Create weekly sequence for mergeing with dataset
+startdate <- min(dat1$ds)
+endate <- max(dat1$ds)
+diff_in_weeks = difftime(endate,startdate, units = "weeks") # weeks
+datedummy <- data.frame("ds" = seq(startdate-1, by = "week", length.out = diff_in_weeks))
+
+# create start and end dates for a wekk
+datedummy <- slide(datedummy, Var = "ds", slideBy = -1)
+datedummy$`ds-1`<- as.Date(datedummy$`ds-1`,origin = lubridate::origin)
+names(datedummy)[names(datedummy) == "ds"] <- "End"
+names(datedummy)[names(datedummy) == "ds-1"] <- "Start"
+
+# add data to weekly sequence
+dat1 <- fuzzy_left_join(
+  datedummy, dat1,
+  by = c("Start" = "ds", "End" = "ds"),
+  match_fun = list(`<`, `>=`)
+  )
+
+# removed start and end dates
+# make the end date of the week our date
+names(dat1)[names(dat1) == "End"] <- "ds"
+myvars <- c("ds",  "y")  
+traindata_digital <- dat1[myvars]
+
+####################################################################
+# Code Chunk 7: Creating full time series set of dates for Linear
+# linear
+# Create weekly sequence for mergeing with dataset
+startdate <- min(dat2$ds)
+endate <- max(dat2$ds)
+diff_in_weeks = difftime(endate,startdate, units = "weeks") # weeks
+datedummy <- data.frame("ds" = seq(startdate-1, by = "week", length.out = diff_in_weeks))
+
+# create start and end dates for a wekk
+datedummy <- slide(datedummy, Var = "ds", slideBy = -1)
+datedummy$`ds-1`<- as.Date(datedummy$`ds-1`,origin = lubridate::origin)
+names(datedummy)[names(datedummy) == "ds"] <- "End"
+names(datedummy)[names(datedummy) == "ds-1"] <- "Start"
+
+# add data to weekly sequence
+dat2 <- fuzzy_left_join(
+  datedummy, dat2,
+  by = c("Start" = "ds", "End" = "ds"),
+  match_fun = list(`<`, `>=`)
+  )
+
+# removed start and end dates
+# make the end date of the week our date
+names(dat2)[names(dat2) == "End"] <- "ds"
+myvars <- c("ds",  "y")  
+traindata_linear <- dat2[myvars]
+
+####################################################################
+# Code Chunk 8: Use Mice and  Random Forest to fill in missing weekly viewership data
+# replace NAs with mice method
+# http://r-statistics.co/Missing-Value-Treatment-With-R.html
+
+miceMod <- mice(traindata_digital[, !names(traindata_digital) %in% "medv"], method="rf")  # perform mice imputation, based on random forests.
+traindata_digital <- complete(miceMod)  # generate the completed data.
+#
+miceMod <- mice(traindata_linear[, !names(traindata_linear) %in% "medv"], method="rf")  # perform mice imputation, based on random forests.
+traindata_linear <- complete(miceMod)
+
+#Remove Negative predictions
+traindata_digital[is.na(traindata_digital)] <- 0
+traindata_linear[is.na(traindata_linear)] <- 0
+
+#Here, I’m following the simplest method of missing value treatment i.e. list wise deletion. 
+####################################################################
+# Code Chunk 9: Outlier dates to be excluded 
+# train prophet model
+
+# Holidays
+playoffs <- data_frame(
+  holiday = 'playoff',
+  ds = as.Date(c('2014-02-02',	'2014-10-31',	'2014-11-27',	'2014-11-28',	'2014-11-29',	'2014-11-30',	'2014-12-24',	'2014-12-25',	'2014-12-31',	'2015-02-01',	'2015-05-24',	'2015-05-25',	'2015-07-04',	'2015-10-31',	'2015-11-26',	'2015-11-27',	'2015-11-28',	'2015-11-29',	'2015-12-24',	'2015-12-25',	'2015-12-31',	'2016-02-07',	'2016-05-29',	'2016-05-30',	'2016-07-04',	'2016-10-31',	'2016-11-24',	'2016-11-25',	'2016-11-27',	'2016-12-24',	'2016-12-25',	'2016-12-31',	'2017-02-05',	'2017-05-28',	'2017-05-29',	'2017-07-04',	'2017-10-31',	'2017-11-23',	'2017-11-24',	'2017-11-25',	'2017-11-26',	'2017-12-24',	'2017-12-25',	'2017-12-31',	'2018-02-04',	'2018-05-27',	'2018-05-28',	'2018-07-04',	'2018-10-31',	'2018-11-22',	'2018-11-23',	'2018-11-24',	'2018-11-25',	'2018-12-24',	'2018-12-25',	'2018-12-31',	'2019-02-03',	'2019-05-26',	'2019-05-27',	'2019-07-04',	'2019-10-31',	'2019-11-28',	'2019-11-29',	'2019-11-30',	'2019-12-01',	'2019-12-24',	'2019-12-25',	'2020-02-02', '2016-04-09')),
+  lower_window = 0,
+  upper_window = 1
+)
+
+superbowls <- data_frame(
+  holiday = 'superbowl',
+  ds = as.Date(c('2010-02-07', '2011-02-06', '2012-02-05',  '2013-02-03', '2014-02-02',  '2015-02-01', '2016-02-07', '2017-02-05', '2018-02-04', '2019-02-03', '2020-02-02')),
+  lower_window = 0,
+  upper_window = 1
+)
+
+holidays <- bind_rows(playoffs, superbowls)
+####################################################################
+# Code Chunk 10: Model training 
+
+# baysian time series model
+#
+md <- prophet(traindata_digital, weekly.seasonality=TRUE, holidays = holidays) #mcmc.samples = 300, changepoint.prior.scale = 0.5, seasonality.mode = 'multiplicative')
+
+
+# baysian time series model
+#
+ml <- prophet(traindata_linear, weekly.seasonality=TRUE,  holidays = holidays) #, mcmc.samples = 300, changepoint.prior.scale = 0.5, seasonality.mode = 'multiplicative')
+
+####################################################################
+# Code Chunk 11: create future dataframe.
+# preiods are the weeks to forecast out
+
+futured <- make_future_dataframe(md ,periods =260, freq="week")
+
+futurel <- make_future_dataframe(ml ,periods =260, freq="week")
+
+# forecasts the future digital values
+####################################################################
+# Code Chunk 12: Forcast future values
+forecastd <- predict(md, futured, weekly_seasonality=TRUE)
+
+# adds the orginal y value to the forecast for metrics
+forecastd <- qpcR:::cbind.na(forecastd, traindata_digital$y)
+names(forecastd)[names(forecastd) == "y"] <- "fact"
+
+# forecasts the future linear values
+
+forecastl <- predict(ml, futurel, weekly_seasonality=TRUE)
+
+# adds the orginal y value to the forecast for metrics
+forecastl <- qpcR:::cbind.na(forecastl, traindata_linear$y)
+names(forecastl)[names(forecastl) == "y"] <- "fact"
+
+####################################################################
+# Code Chunk 13: make final percentages
+
+percentages <- merge(forecastd[c('ds','yhat','fact')],forecastl[c('ds','yhat','fact')],by.x='ds', by.y='ds')
+
+names(percentages)[names(percentages) == "yhat.x"] <- "average_mins_viewed"
+names(percentages)[names(percentages) == "yhat.y"] <- "imps"
+names(percentages)[names(percentages) == "fact.x"] <- "Actual_AMV"
+names(percentages)[names(percentages) == "fact.y"] <- "Actual_Imps"
+
+
+percentages[percentages<0] <- 0
+
+percentages$percent_digital <- (percentages$average_mins_viewed / (percentages$average_mins_viewed + percentages$imps)) * 100
+percentages$percent_linear <- (percentages$imps / (percentages$average_mins_viewed + percentages$imps)) * 100
+percentages$show <- ShowName
+percentages$model <- 'USEING_MICE'
+
+percentages$percent_digital[percentages$percent_digital>100] <- 100
+
+percentages$percent_linear[percentages$percent_linear>100] <- 100
+
+####################################################################
+# Code Chunk 14: Cross Validation
+
+# cross validation and metrics
+df.cvd <- cross_validation(md, initial = as.integer(nrowsdf*.7) , period =  52, horizon = as.integer(nrowsdf*.2), units = 'weeks')
+
+df.cvl <- cross_validation(ml, initial = as.integer(nrowsdf*.7) , period =  52, horizon = as.integer(nrowsdf*.2), units = 'weeks')
+
+
+df.pd <- performance_metrics(df.cvd)
+df.pd$show <- ShowName
+df.pd$type <- "Digital"
+
+df.pl <- performance_metrics(df.cvl)
+df.pl$show <- ShowName
+df.pl$type <- "Linear"
+
+showstats <- data.frame(rbind(df.pd, df.pl))
+
+####################################################################
+# Code Chunk 15: Upload to Bigquery
+
+# # Upload to google bigquery
+ 
+project <- "capstone-247602"
+
+insert_upload_job(project, 'predictions', 'ALL_SHOWS_Predictions', percentages, billing = project, #ALL_SHOWS_NO_MISSING_DATA
+  create_disposition = "CREATE_IF_NEEDED",
+  write_disposition = "WRITE_APPEND")
+
+
+stats <- rbind(stats, showstats)
+
+ }
+
+####################################################################
+# Code Chunk 16: save status to csv file
+# # save stats as csv file, then upload to google bigquery
+write.csv(stats,"stats_ALL_SHOWS_NO_MISSING_DATA.csv", row.names = FALSE)
+
+```
+
+
+
+
+
